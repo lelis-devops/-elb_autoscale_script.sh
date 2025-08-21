@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export PORT=3000
+export PORT=5432
 export DB_HOST=localhost
 export DB_PORT=5329
 export DB_USER=mariadb
