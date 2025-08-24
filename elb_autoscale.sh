@@ -1,51 +1,95 @@
 #!/bin/bash
 
-export DB_HOST=nebuladb.cpie8isakvgh.us-east-2.rds.amazonaws.com
-export DB_PORT=5432            
-export DB_USER=Dev1            
-export DB_PASSWORD='D@ni55cssmile22'
-export DB_NAME=catalogo
+launch_template="DevTemplate"
+asg_name="DevASG"
 
-export PGPASSWORD=$DB_PASSWORD
+create_launch_template() {
+  version_description="v1"
 
-echo "Variáveis de ambiente configuradas."
+  aws ec2 create-launch-template \
+    --launch-template-name "$launch_template" \
+    --version-description "$version_description" \
+    --launch-template-data '{
+      "ImageId": "ami-0c55b159cbfafe1f0",
+      "InstanceType": "t3.micro",
+      "KeyName": "ketchup",
+      "SecurityGroupIds": ["sg-0123456789abcdef0"],
+      "UserData": "'"$(echo -n '#!/bin/bash
+      yum update -y
+      yum install -y httpd
+      systemctl start httpd
+      systemctl enable httpd
+      echo "<h1>Welcome, Sir! </h1>" > /var/www/html/index.html' | base64)"'"
+    }'
+}
 
-# Verifica se o banco existe
-DB_EXISTS=$(psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME';")
+create_target_group() {
+  name_tg="nebula"
+  vpc_id="vpc-0b17fdb1a62eec6b2"
 
-if [ "$DB_EXISTS" = "1" ]; then
-    echo "Banco $DB_NAME já existe no RDS."
-else
-    psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d postgres -c "CREATE DATABASE $DB_NAME;"
-    echo "Banco $DB_NAME criado com sucesso no RDS!"
-fi
+  tg_arn=$(aws elbv2 create-target-group \
+    --name "$name_tg" \
+    --protocol HTTP \
+    --port 80 \
+    --vpc-id "$vpc_id" \
+    --query 'TargetGroups[0].TargetGroupArn' \
+    --output text)
+}
 
-echo "Banco pronto! Aplicando schema e seed..."
+create_load_balancer() {
+  name_lb="newnebu"
+  subnets_lb="subnet-05682cb0af67aa733 subnet-0b5662c9abe10f0d3 subnet-0796e9a01082d7405"
+  security_group="sg-02e1cb308c27a897a"
 
-# Aplica schema e seed diretamente no banco criado
-psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME <<EOF
--- Schema
-CREATE TABLE IF NOT EXISTS clientes (
-    id SERIAL PRIMARY KEY,
-    nome VARCHAR(100) NOT NULL,
-    email VARCHAR(100) UNIQUE
-);
+  lb_arn=$(aws elbv2 create-load-balancer \
+    --name "$name_lb" \
+    --subnets $subnets_lb \
+    --security-groups "$security_group" \
+    --query 'LoadBalancers[0].LoadBalancerArn' \
+    --output text)
+}
 
-CREATE TABLE IF NOT EXISTS pedidos (
-    id SERIAL PRIMARY KEY,
-    cliente_id INT REFERENCES clientes(id),
-    valor DECIMAL(10,2) NOT NULL,
-    data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+create_auto_scaling_group() {
 
--- Seed
-INSERT INTO clientes (nome, email) VALUES
-('Rainha', 'rainha@exemplo.com')
-ON CONFLICT (email) DO NOTHING;
+  aws autoscaling create-auto-scaling-group \
+    --auto-scaling-group-name "$asg_name" \
+    --launch-template LaunchTemplateName="$launch_template",Version=1 \
+    --min-size 1 \
+    --max-size 3 \
+    --desired-capacity 1 \
+    --vpc-zone-identifier "$subnets_lb" \
+    --target-group-arns "$tg_arn"
+}
 
-INSERT INTO pedidos (cliente_id, valor) VALUES
-(1, 150.50),
-(2, 200.00);
-EOF
+create_scaling_policy() {
+  policy_arn=$(aws autoscaling put-scaling-policy \
+    --policy-name ScaleOutPolicy \
+    --auto-scaling-group-name "$asg_name" \
+    --scaling-adjustment 1 \
+    --adjustment-type ChangeInCapacity \
+    --cooldown 300 \
+    --query 'PolicyARN' \
+    --output text)
+}
 
-echo "Schema e seed aplicados com sucesso!"
+create_cloud_watch() {
+  aws cloudwatch put-metric-alarm \
+    --alarm-name "HighCPUAlarm" \
+    --metric-name CPUUtilization \
+    --namespace AWS/EC2 \
+    --statistic Average \
+    --period 60 \
+    --threshold 70 \
+    --comparison-operator GreaterThanThreshold \
+    --dimensions Name=AutoScalingGroupName,Value="$asg_name" \
+    --evaluation-periods 2 \
+    --alarm-actions "$policy_arn"
+}
+
+
+create_launch_template
+create_target_group
+create_load_balancer
+create_auto_scaling_group
+create_scaling_policy
+create_cloud_watch
